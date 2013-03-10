@@ -1,0 +1,171 @@
+#!/usr/bin/python
+import threading
+import Queue
+import time
+import re
+import json
+import sys
+import csv
+import codecs
+import cStringIO
+import argparse
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.firefox.firefox_profile import FirefoxProfile
+
+class UnicodeWriter:
+    """
+    A CSV writer which will write rows to CSV file "f",
+    which is encoded in the given encoding.
+    """
+
+    def __init__(self, f, dialect=csv.excel, encoding="utf-8", **kwds):
+        # Redirect output to a queue
+        self.queue = cStringIO.StringIO()
+        self.writer = csv.writer(self.queue, dialect=dialect, **kwds)
+        self.stream = f
+        self.encoder = codecs.getincrementalencoder(encoding)()
+
+    def writerow(self, row):
+        self.writer.writerow([s.encode("utf-8") for s in row])
+        # Fetch UTF-8 output from the queue ...
+        data = self.queue.getvalue()
+        data = data.decode("utf-8")
+        # ... and reencode it into the target encoding
+        data = self.encoder.encode(data)
+        # write to the target stream
+        self.stream.write(data)
+        # empty queue
+        self.queue.truncate(0)
+
+    def writerows(self, rows):
+        for row in rows:
+            self.writerow(row)
+
+
+class ScrapeWorker(threading.Thread):
+    """
+    A Selenium worker which will pull SCP wiki page names
+    from in_queue and write vote lists to out_queue
+    """
+
+    def __init__(self, in_queue, out_queue):
+        threading.Thread.__init__(self)
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+
+        fireFoxProfile = FirefoxProfile()
+        fireFoxProfile.set_preference('permissions.default.stylesheet', 2)
+        fireFoxProfile.set_preference('permissions.default.image', 2)
+        self.profile = fireFoxProfile
+        self.driver = None
+
+
+    def run(self):
+
+        driver = webdriver.Firefox(self.profile)
+        self.driver = driver
+
+        while True:
+            title = self.in_queue.get()
+            driver.get("http://www.scp-wiki.net/" + title )
+
+            try:
+                # Find rating module
+                link = driver.find_element_by_css_selector("#pagerate-button")
+                link.click()
+
+                # Find "Look who rated" link
+                link = WebDriverWait(driver, 10).until(\
+                        lambda driver: driver.find_element_by_link_text("Look who rated this page"))
+                link.click()
+
+                # Find vote area
+                WebDriverWait(driver, 10).until(\
+                    lambda driver : driver.find_element_by_id("who-rated-page-area"))
+
+                # Find user spans
+                user_spans = WebDriverWait(driver, 10).until(\
+                    lambda driver : driver.find_elements_by_class_name('printuser'))
+
+            except Exception, e:
+                print title + ": no votes!"
+                self.in_queue.task_done()
+                continue
+
+            users = []
+            for span in user_spans:
+                users.append(span.text)
+
+            # Find vote spans
+            votes = []
+            spans = driver.find_elements_by_xpath('//span[@style="color:#777"]')
+            for span in spans:
+                votes.append(span.text)
+
+            page_votes = []
+            user_votes = zip(users,votes)
+            for vote in user_votes:
+                if vote[0] == '(account deleted)': continue # skip deleted accounts
+                line = [title]
+                line.extend(list(vote))
+                page_votes.append(line)
+            self.out_queue.put(page_votes)
+            self.in_queue.task_done()
+
+    def cleanup(self):
+        self.driver.close()
+
+
+class CSVWorker(threading.Thread):
+    """
+    Worker thread that consumes vote lists from out_queue
+    and writes lines to a csv file
+    """
+    def __init__(self, out_queue):
+        threading.Thread.__init__(self)
+        self.out_queue = out_queue
+
+    def run(self):
+        self.csv_file = UnicodeWriter(open("votes.csv", "wb",0))
+        while True:
+            page_votes = self.out_queue.get()
+            self.csv_file.writerows(page_votes)
+            self.out_queue.task_done()
+
+#Globals
+in_queue = Queue.Queue()
+out_queue = Queue.Queue()
+start = time.time()
+
+def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('threads', type=int, default=4, nargs='?')
+    args = parser.parse_args()
+    worker_count = args.threads
+    workers = []
+
+    for i in range(worker_count):
+        t = ScrapeWorker(in_queue,out_queue)
+        t.setDaemon(True)
+        t.start()
+        workers.append(t)
+
+    csv_worker = CSVWorker(out_queue)
+    csv_worker.setDaemon(True)
+    csv_worker.start()
+
+    for line in sys.stdin:
+        line = line.rstrip('\n')
+        in_queue.put(line)
+
+    in_queue.join()
+    out_queue.join()
+
+    for worker in workers:
+        worker.cleanup()
+
+main()
+print("Elapsed Time: %s" % (time.time() - start))
